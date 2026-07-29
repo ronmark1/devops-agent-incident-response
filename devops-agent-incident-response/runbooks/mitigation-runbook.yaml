@@ -1,0 +1,86 @@
+schemaVersion: '0.3'
+description: >-
+  Default mitigation runbook invoked by the DevOps Agent incident-response
+  workflow after human approval. Branches to a safe remediation based on the
+  Action parameter. Reuse an existing runbook instead by having the DevOps Agent
+  return its name in findings.mitigation.runbookName.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  AutomationAssumeRole:
+    type: String
+    description: IAM role the automation assumes.
+  Action:
+    type: String
+    default: Diagnose
+    allowedValues: [Diagnose, RebootInstance, RestartEcsService, RefreshAsg]
+    description: Remediation action to perform.
+  InstanceId:
+    type: String
+    default: ''
+    description: EC2 instance id (RebootInstance).
+  EcsCluster:
+    type: String
+    default: ''
+    description: ECS cluster name (RestartEcsService).
+  EcsService:
+    type: String
+    default: ''
+    description: ECS service name (RestartEcsService).
+  AutoScalingGroupName:
+    type: String
+    default: ''
+    description: Auto Scaling group (RefreshAsg).
+mainSteps:
+  - name: Branch
+    action: aws:branch
+    inputs:
+      Choices:
+        - NextStep: RebootInstance
+          Variable: '{{ Action }}'
+          StringEquals: RebootInstance
+        - NextStep: RestartEcsService
+          Variable: '{{ Action }}'
+          StringEquals: RestartEcsService
+        - NextStep: RefreshAsg
+          Variable: '{{ Action }}'
+          StringEquals: RefreshAsg
+      Default: Diagnose
+
+  - name: Diagnose
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: cloudwatch
+      Api: DescribeAlarmHistory
+      MaxRecords: 5
+    outputs:
+      - Name: AlarmHistory
+        Selector: '$.AlarmHistoryItems'
+        Type: MapList
+
+  - name: RebootInstance
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: ec2
+      Api: RebootInstances
+      InstanceIds:
+        - '{{ InstanceId }}'
+
+  - name: RestartEcsService
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: ecs
+      Api: UpdateService
+      cluster: '{{ EcsCluster }}'
+      service: '{{ EcsService }}'
+      forceNewDeployment: true
+
+  - name: RefreshAsg
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: autoscaling
+      Api: StartInstanceRefresh
+      AutoScalingGroupName: '{{ AutoScalingGroupName }}'

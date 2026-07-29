@@ -1,0 +1,211 @@
+{
+  "Comment": "AWS DevOps Agent incident response with human-in-the-loop approval",
+  "StartAt": "CreateTicket",
+  "States": {
+    "CreateTicket": {
+      "Type": "Task",
+      "Resource": "${CreateTicketArn}",
+      "ResultPath": "$",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "MaxAttempts": 3, "IntervalSeconds": 5, "BackoffRate": 2 }],
+      "Next": "WaitForInvestigation"
+    },
+
+    "WaitForInvestigation": {
+      "Type": "Wait",
+      "Seconds": 45,
+      "Next": "FetchFindings"
+    },
+
+    "FetchFindings": {
+      "Type": "Task",
+      "Resource": "${FetchFindingsArn}",
+      "ResultPath": "$",
+      "Retry": [
+        { "ErrorEquals": ["InvestigationPending"], "MaxAttempts": 10, "IntervalSeconds": 30, "BackoffRate": 1.5 }
+      ],
+      "Next": "NotifyFindings"
+    },
+
+    "NotifyFindings": {
+      "Type": "Task",
+      "Resource": "${NotifyGlipArn}",
+      "Parameters": { "phase": "findings", "incidentId.$": "$.incidentId", "alarm.$": "$.alarm", "findings.$": "$.findings", "ticketId.$": "$.ticketId" },
+      "ResultPath": null,
+      "Next": "UpdateTicketFindings"
+    },
+
+    "UpdateTicketFindings": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": { "phase": "findings", "ticketId.$": "$.ticketId", "findings.$": "$.findings" },
+      "ResultPath": null,
+      "Next": "RequestApproval"
+    },
+
+    "RequestApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${RequestApprovalArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "incidentId.$": "$.incidentId",
+          "ticketId.$": "$.ticketId",
+          "findings.$": "$.findings"
+        }
+      },
+      "ResultPath": "$.approval",
+      "TimeoutSeconds": 86400,
+      "Catch": [{ "ErrorEquals": ["States.Timeout"], "ResultPath": "$.approval", "Next": "ApprovalTimedOut" }],
+      "Next": "ApprovalChoice"
+    },
+
+    "ApprovalChoice": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.approval.decision", "StringEquals": "approve", "Next": "UpdateTicketApproved" }
+      ],
+      "Default": "UpdateTicketRejected"
+    },
+
+    "UpdateTicketApproved": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": { "phase": "approved", "ticketId.$": "$.ticketId", "findings.$": "$.findings", "approver.$": "$.approval.approver" },
+      "ResultPath": null,
+      "Next": "HasRunbook"
+    },
+
+    "HasRunbook": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.findings.mitigation.runbookName", "StringEquals": "", "Next": "ManualRemediationNote" }
+      ],
+      "Default": "StartAutomation"
+    },
+
+    "StartAutomation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:startAutomationExecution",
+      "Parameters": {
+        "DocumentName.$": "$.findings.mitigation.runbookName",
+        "Parameters.$": "$.findings.mitigation.runbookParameters"
+      },
+      "ResultPath": "$.automation",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.automationError", "Next": "ManualRemediationNote" }],
+      "Next": "WaitAutomation"
+    },
+
+    "WaitAutomation": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "GetAutomation"
+    },
+
+    "GetAutomation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getAutomationExecution",
+      "Parameters": { "AutomationExecutionId.$": "$.automation.AutomationExecutionId" },
+      "ResultPath": "$.automationStatus",
+      "Next": "AutomationDone"
+    },
+
+    "AutomationDone": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.automationStatus.AutomationExecution.AutomationExecutionStatus", "StringEquals": "InProgress", "Next": "WaitAutomation" },
+        { "Variable": "$.automationStatus.AutomationExecution.AutomationExecutionStatus", "StringEquals": "Pending", "Next": "WaitAutomation" },
+        { "Variable": "$.automationStatus.AutomationExecution.AutomationExecutionStatus", "StringEquals": "Waiting", "Next": "WaitAutomation" }
+      ],
+      "Default": "BuildRemediationResult"
+    },
+
+    "BuildRemediationResult": {
+      "Type": "Pass",
+      "Parameters": {
+        "status.$": "$.automationStatus.AutomationExecution.AutomationExecutionStatus",
+        "executionId.$": "$.automation.AutomationExecutionId"
+      },
+      "ResultPath": "$.remediationResult",
+      "Next": "UpdateTicketRemediated"
+    },
+
+    "ManualRemediationNote": {
+      "Type": "Pass",
+      "Parameters": { "status": "MANUAL_REQUIRED", "executionId": "n/a" },
+      "ResultPath": "$.remediationResult",
+      "Next": "UpdateTicketRemediated"
+    },
+
+    "UpdateTicketRemediated": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": {
+        "phase": "remediated",
+        "ticketId.$": "$.ticketId",
+        "remediationResult.$": "$.remediationResult"
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "RegisterClearWatch" }],
+      "Next": "RegisterClearWatch"
+    },
+
+    "RegisterClearWatch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${WaitClearArn}",
+        "Payload": {
+          "taskToken.$": "$$.Task.Token",
+          "incidentId.$": "$.incidentId",
+          "ticketId.$": "$.ticketId",
+          "alarm.$": "$.alarm"
+        }
+      },
+      "ResultPath": "$.cleared",
+      "TimeoutSeconds": 86400,
+      "Catch": [{ "ErrorEquals": ["States.Timeout"], "ResultPath": "$.cleared", "Next": "CloseTicket" }],
+      "Next": "CloseTicket"
+    },
+
+    "CloseTicket": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": { "phase": "close", "ticketId.$": "$.ticketId" },
+      "ResultPath": null,
+      "Next": "NotifyResolved"
+    },
+
+    "NotifyResolved": {
+      "Type": "Task",
+      "Resource": "${NotifyGlipArn}",
+      "Parameters": { "phase": "resolved", "incidentId.$": "$.incidentId", "alarm.$": "$.alarm", "ticketId.$": "$.ticketId" },
+      "ResultPath": null,
+      "End": true
+    },
+
+    "UpdateTicketRejected": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": { "phase": "rejected", "ticketId.$": "$.ticketId", "approver.$": "$.approval.approver" },
+      "ResultPath": null,
+      "Next": "NotifyRejected"
+    },
+
+    "NotifyRejected": {
+      "Type": "Task",
+      "Resource": "${NotifyGlipArn}",
+      "Parameters": { "phase": "rejected", "incidentId.$": "$.incidentId", "ticketId.$": "$.ticketId", "findings.$": "$.findings" },
+      "ResultPath": null,
+      "End": true
+    },
+
+    "ApprovalTimedOut": {
+      "Type": "Task",
+      "Resource": "${UpdateTicketArn}",
+      "Parameters": { "phase": "note", "ticketId.$": "$.ticketId", "message": "Approval request timed out after 24h with no decision. Escalating for manual handling." },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}

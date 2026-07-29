@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Self-contained event-driven AWS DevOps Agent -> RingCentral Glip (single
+  Adaptive Card with Approve/Reject) -> Freshservice ticket -> SSM runbook.
+  Creates its own secret, SNS alarm topic, SSM runbook, and automation role, so
+  the earlier stack can be deleted entirely.
+
+Parameters:
+  DevOpsAgentWebhookUrl: { Type: String }
+  DevOpsAgentWebhookSecret: { Type: String, NoEcho: true }
+  GlipWebhookUrl: { Type: String, NoEcho: true }
+  FreshserviceDomain: { Type: String }
+  FreshserviceApiKey: { Type: String, NoEcho: true }
+  AgentSpaceId:
+    Type: String
+    Description: DevOps Agent Space ID (from your Investigation Completed events).
+  ApprovalSigningKey:
+    Type: String
+    NoEcho: true
+    Description: Random string used to HMAC-sign the Approve/Reject links.
+  FreshserviceGroupId: { Type: String }
+  FreshserviceWorkspaceId: { Type: String, Default: "2" }
+  FreshserviceCategory: { Type: String, Default: "DevOps Support" }
+  FreshserviceRequesterEmail: { Type: String, Default: devops-agent@example.com }
+  TicketDedupWindowSeconds:
+    Type: String
+    Default: "3600"
+    Description: Suppress duplicate tickets for the same alarm within this many seconds.
+  ApprovalTtlSeconds:
+    Type: String
+    Default: "14400"
+    Description: How long an Approve/Reject link stays valid, in seconds (default 4 hours).
+  AllowedActions:
+    Type: String
+    Default: "Diagnose,RebootInstance,RestartEcsService,RefreshAsg"
+    Description: Comma-separated allow-list of remediation actions the approver may run.
+  RequireRemediationTag:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: If true, only act on resources carrying the remediation opt-in tag.
+  RemediationTagKey:
+    Type: String
+    Default: "devops-agent-remediation"
+  RemediationTagValue:
+    Type: String
+    Default: "allowed"
+
+Resources:
+
+  IntegrationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-integration'
+      SecretString: !Sub |
+        {
+          "devopsAgentWebhookUrl": "${DevOpsAgentWebhookUrl}",
+          "devopsAgentWebhookSecret": "${DevOpsAgentWebhookSecret}",
+          "glipWebhookUrl": "${GlipWebhookUrl}",
+          "freshserviceDomain": "${FreshserviceDomain}",
+          "freshserviceApiKey": "${FreshserviceApiKey}"
+        }
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatch
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: SNS:Publish
+            Resource: !Ref AlarmTopic
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+
+  MitigationRunbook:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: !Sub '${AWS::StackName}-mitigation'
+      Content:
+        schemaVersion: '0.3'
+        description: Default mitigation runbook (branch on Action).
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole: { type: String, default: !GetAtt AutomationAssumeRole.Arn }
+          Action:
+            type: String
+            default: Diagnose
+            allowedValues: [Diagnose, RebootInstance, RestartEcsService, RefreshAsg]
+          InstanceId: { type: String, default: '' }
+          EcsCluster: { type: String, default: '' }
+          EcsService: { type: String, default: '' }
+          AutoScalingGroupName: { type: String, default: '' }
+        mainSteps:
+          - name: Branch
+            action: aws:branch
+            inputs:
+              Choices:
+                - { NextStep: RebootInstance, Variable: '{{ Action }}', StringEquals: RebootInstance }
+                - { NextStep: RestartEcsService, Variable: '{{ Action }}', StringEquals: RestartEcsService }
+                - { NextStep: RefreshAsg, Variable: '{{ Action }}', StringEquals: RefreshAsg }
+              Default: Diagnose
+          - name: Diagnose
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: cloudwatch, Api: DescribeAlarmHistory, MaxRecords: 5 }
+          - name: RebootInstance
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: ec2, Api: RebootInstances, InstanceIds: ['{{ InstanceId }}'] }
+          - name: RestartEcsService
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: ecs, Api: UpdateService, cluster: '{{ EcsCluster }}', service: '{{ EcsService }}', forceNewDeployment: true }
+          - name: RefreshAsg
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: autoscaling, Api: StartInstanceRefresh, AutoScalingGroupName: '{{ AutoScalingGroupName }}' }
+
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: mitigation-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RebootInstances
+                  - ecs:UpdateService
+                  - autoscaling:StartInstanceRefresh
+                  - cloudwatch:DescribeAlarmHistory
+                Resource: '*'
+
+  FindingsHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      CodeUri: functions/findings_handler/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures: [arm64]
+      Timeout: 60
+      MemorySize: 256
+      FunctionUrlConfig:
+        AuthType: NONE
+      Environment:
+        Variables:
+          INTEGRATION_SECRET_ARN: !Ref IntegrationSecret
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          RUNBOOK_NAME: !Ref MitigationRunbook
+          AUTOMATION_ROLE_ARN: !GetAtt AutomationAssumeRole.Arn
+          APPROVAL_SIGNING_KEY: !Ref ApprovalSigningKey
+          FRESHSERVICE_GROUP_ID: !Ref FreshserviceGroupId
+          FRESHSERVICE_WORKSPACE_ID: !Ref FreshserviceWorkspaceId
+          FRESHSERVICE_CATEGORY: !Ref FreshserviceCategory
+          FRESHSERVICE_REQUESTER_EMAIL: !Ref FreshserviceRequesterEmail
+          TICKET_DEDUP_WINDOW_SECONDS: !Ref TicketDedupWindowSeconds
+          APPROVAL_TTL_SECONDS: !Ref ApprovalTtlSeconds
+          ALLOWED_ACTIONS: !Ref AllowedActions
+          REQUIRE_REMEDIATION_TAG: !Ref RequireRemediationTag
+          REMEDIATION_TAG_KEY: !Ref RemediationTagKey
+          REMEDIATION_TAG_VALUE: !Ref RemediationTagValue
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref IntegrationSecret
+            - Effect: Allow
+              Action: [ssm:GetParameter, ssm:PutParameter]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/findings-handler/*'
+            - Effect: Allow
+              Action:
+                - aidevops:ListJournalRecords
+                - aidevops:ListBacklogTasks
+                - aidevops:ListExecutions
+                - aidevops:CreateChat
+                - aidevops:SendMessage
+                - aidevops:ListPendingMessages
+              Resource: '*'
+            - Effect: Allow
+              Action: lambda:GetFunctionUrlConfig
+              Resource: '*'
+            - Effect: Allow
+              Action: [ssm:StartAutomationExecution, ssm:GetAutomationExecution]
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeTags
+                - ecs:DescribeServices
+                - autoscaling:DescribeAutoScalingGroups
+              Resource: '*'
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt AutomationAssumeRole.Arn
+      Events:
+        Alarm:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlarmTopic
+        Lifecycle:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.aidevops]
+              detail-type:
+                - Investigation Completed
+                - Investigation Failed
+                - Investigation Timed Out
+                - Mitigation Completed
+                - Mitigation Failed
+              detail:
+                metadata:
+                  agent_space_id: [!Ref AgentSpaceId]
+
+Outputs:
+  AlarmTopicArn:
+    Description: Point your CloudWatch alarms' AlarmActions here.
+    Value: !Ref AlarmTopic
+  FindingsHandlerUrl:
+    Description: Function URL backing the Approve/Reject links.
+    Value: !GetAtt FindingsHandlerFunctionUrl.FunctionUrl
+  MitigationRunbookName:
+    Value: !Ref MitigationRunbook

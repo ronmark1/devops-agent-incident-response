@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  AWS DevOps Agent -> RingCentral Glip -> Freshservice automated incident
+  response with human-in-the-loop approval and SSM runbook remediation.
+  CloudWatch Alarm -> SNS -> Lambda (webhook bridge) -> DevOps Agent ->
+  Glip approval -> SSM Automation -> Alarm cleared.
+
+# ------------------------------------------------------------------------- #
+# Parameters  (fill these in per account -- see parameters.example.json)
+# ------------------------------------------------------------------------- #
+Parameters:
+  DevOpsAgentWebhookUrl:
+    Type: String
+    Description: DevOps Agent Space webhook URL (Agent Space > Capabilities > Webhooks).
+  DevOpsAgentWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: HMAC secret paired with the DevOps Agent webhook.
+  DevOpsAgentApiBase:
+    Type: String
+    Default: ''
+    Description: (Optional) Base URL to retrieve investigation results, e.g. https://devops-agent.<region>.amazonaws.com.
+  DevOpsAgentApiKey:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: (Optional) API key/token to read investigation results.
+  GlipWebhookUrl:
+    Type: String
+    NoEcho: true
+    Description: RingCentral Glip incoming webhook URL.
+  FreshserviceDomain:
+    Type: String
+    Description: Freshservice domain, e.g. yourcompany.freshservice.com
+  FreshserviceApiKey:
+    Type: String
+    NoEcho: true
+    Description: Freshservice API key.
+  FreshserviceRequesterEmail:
+    Type: String
+    Default: aws-devops-agent@example.com
+    Description: Requester email stamped on created tickets.
+  ApprovalSigningKey:
+    Type: String
+    NoEcho: true
+    Description: Random string used to HMAC-sign Glip approval links.
+  CreateDefaultRunbook:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'true'
+    Description: Create the bundled SSM mitigation runbook. Set false to reuse existing runbooks only.
+  ExistingDefaultRunbookName:
+    Type: String
+    Default: ''
+    Description: Fallback SSM runbook name when the Agent returns none (used if CreateDefaultRunbook=false).
+  AdditionalPublisherAccountIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: (Optional) Other AWS account IDs allowed to publish alarms to the SNS topic (cross-account).
+
+Conditions:
+  ShouldCreateRunbook: !Equals [!Ref CreateDefaultRunbook, 'true']
+  HasCrossAccount: !Not [!Equals [!Join ['', !Ref AdditionalPublisherAccountIds], '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Handler: app.handler
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [arm64]
+    Layers: [!Ref CommonLayer]
+    Environment:
+      Variables:
+        INTEGRATION_SECRET_ARN: !Ref IntegrationSecret
+
+Resources:
+
+  # ----------------------------- Secrets ---------------------------------- #
+  IntegrationSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-integration'
+      Description: All third-party endpoints and keys for the incident-response workflow.
+      SecretString: !Sub |
+        {
+          "devopsAgentWebhookUrl": "${DevOpsAgentWebhookUrl}",
+          "devopsAgentWebhookSecret": "${DevOpsAgentWebhookSecret}",
+          "devopsAgentApiBase": "${DevOpsAgentApiBase}",
+          "devopsAgentApiKey": "${DevOpsAgentApiKey}",
+          "glipWebhookUrl": "${GlipWebhookUrl}",
+          "freshserviceDomain": "${FreshserviceDomain}",
+          "freshserviceApiKey": "${FreshserviceApiKey}"
+        }
+
+  # ------------------------ Shared code layer ----------------------------- #
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-common'
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.12]
+    Metadata:
+      BuildMethod: python3.12
+
+  # --------------------------- State store -------------------------------- #
+  ApprovalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ------------------------- Alarm ingestion ------------------------------ #
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+
+  AlarmDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+
+  AlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlarmTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchThisAccount
+            Effect: Allow
+            Principal: { Service: cloudwatch.amazonaws.com }
+            Action: SNS:Publish
+            Resource: !Ref AlarmTopic
+            Condition: { StringEquals: { 'aws:SourceAccount': !Ref 'AWS::AccountId' } }
+          - !If
+            - HasCrossAccount
+            - Sid: AllowCrossAccountPublish
+              Effect: Allow
+              Principal: { AWS: !Ref AdditionalPublisherAccountIds }
+              Action: SNS:Publish
+              Resource: !Ref AlarmTopic
+            - !Ref 'AWS::NoValue'
+
+  # --------------------------- Lambda: bridge ----------------------------- #
+  WebhookBridgeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/webhook_bridge/
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref IncidentStateMachine
+      Policies:
+        - !Ref SecretReadPolicy
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref IncidentStateMachine
+      Events:
+        Alarm:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlarmTopic
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt AlarmDLQ.Arn
+
+  # ------------------- Lambdas used by the state machine ------------------ #
+  CreateTicketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/create_ticket/
+      Environment:
+        Variables:
+          FRESHSERVICE_REQUESTER_EMAIL: !Ref FreshserviceRequesterEmail
+      Policies: [!Ref SecretReadPolicy]
+
+  FetchFindingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/fetch_findings/
+      Timeout: 60
+      Environment:
+        Variables:
+          DEFAULT_RUNBOOK_NAME: !If
+            - ShouldCreateRunbook
+            - !Ref MitigationRunbook
+            - !Ref ExistingDefaultRunbookName
+      Policies: [!Ref SecretReadPolicy]
+
+  NotifyGlipFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notify_glip/
+      Policies: [!Ref SecretReadPolicy]
+
+  UpdateTicketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/update_ticket/
+      Policies: [!Ref SecretReadPolicy]
+
+  RequestApprovalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/request_approval/
+      Environment:
+        Variables:
+          APPROVALS_TABLE: !Ref ApprovalsTable
+          APPROVAL_SIGNING_KEY: !Ref ApprovalSigningKey
+          APPROVAL_CALLBACK_URL: !Sub 'https://${ApprovalApi}.execute-api.${AWS::Region}.amazonaws.com'
+      Policies:
+        - !Ref SecretReadPolicy
+        - DynamoDBWritePolicy: { TableName: !Ref ApprovalsTable }
+
+  WaitClearFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/wait_clear/
+      Environment:
+        Variables:
+          APPROVALS_TABLE: !Ref ApprovalsTable
+      Policies:
+        - DynamoDBWritePolicy: { TableName: !Ref ApprovalsTable }
+
+  # --------------- Lambdas triggered outside the state machine ------------ #
+  ApprovalCallbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/approval_callback/
+      Environment:
+        Variables:
+          APPROVALS_TABLE: !Ref ApprovalsTable
+          APPROVAL_SIGNING_KEY: !Ref ApprovalSigningKey
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ApprovalsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [states:SendTaskSuccess, states:SendTaskFailure]
+              Resource: '*'
+      Events:
+        Approve:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref ApprovalApi
+            Method: GET
+            Path: /approval
+
+  AlarmClearFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/alarm_clear/
+      Environment:
+        Variables:
+          APPROVALS_TABLE: !Ref ApprovalsTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ApprovalsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [states:SendTaskSuccess, states:SendTaskFailure]
+              Resource: '*'
+      Events:
+        AlarmOk:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.cloudwatch]
+              detail-type: ['CloudWatch Alarm State Change']
+              detail:
+                state:
+                  value: [OK]
+
+  # ------------------------ Approval callback API ------------------------- #
+  ApprovalApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: '$default'
+
+  # --------------------------- State machine ------------------------------ #
+  IncidentStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: statemachine/incident_response.asl.json
+      DefinitionSubstitutions:
+        CreateTicketArn: !GetAtt CreateTicketFunction.Arn
+        FetchFindingsArn: !GetAtt FetchFindingsFunction.Arn
+        NotifyGlipArn: !GetAtt NotifyGlipFunction.Arn
+        UpdateTicketArn: !GetAtt UpdateTicketFunction.Arn
+        RequestApprovalArn: !GetAtt RequestApprovalFunction.Arn
+        WaitClearArn: !GetAtt WaitClearFunction.Arn
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref CreateTicketFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref FetchFindingsFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref NotifyGlipFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref UpdateTicketFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref RequestApprovalFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref WaitClearFunction }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ssm:StartAutomationExecution
+                - ssm:GetAutomationExecution
+              Resource: '*'
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt AutomationAssumeRole.Arn
+
+  # -------------------------- SSM remediation ----------------------------- #
+  MitigationRunbook:
+    Type: AWS::SSM::Document
+    Condition: ShouldCreateRunbook
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: !Sub '${AWS::StackName}-mitigation'
+      Content:
+        schemaVersion: '0.3'
+        description: Default mitigation runbook (branch on Action).
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole: { type: String, default: !GetAtt AutomationAssumeRole.Arn }
+          Action:
+            type: String
+            default: Diagnose
+            allowedValues: [Diagnose, RebootInstance, RestartEcsService, RefreshAsg]
+          InstanceId: { type: String, default: '' }
+          EcsCluster: { type: String, default: '' }
+          EcsService: { type: String, default: '' }
+          AutoScalingGroupName: { type: String, default: '' }
+        mainSteps:
+          - name: Branch
+            action: aws:branch
+            inputs:
+              Choices:
+                - { NextStep: RebootInstance, Variable: '{{ Action }}', StringEquals: RebootInstance }
+                - { NextStep: RestartEcsService, Variable: '{{ Action }}', StringEquals: RestartEcsService }
+                - { NextStep: RefreshAsg, Variable: '{{ Action }}', StringEquals: RefreshAsg }
+              Default: Diagnose
+          - name: Diagnose
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: cloudwatch, Api: DescribeAlarmHistory, MaxRecords: 5 }
+          - name: RebootInstance
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: ec2, Api: RebootInstances, InstanceIds: ['{{ InstanceId }}'] }
+          - name: RestartEcsService
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: ecs, Api: UpdateService, cluster: '{{ EcsCluster }}', service: '{{ EcsService }}', forceNewDeployment: true }
+          - name: RefreshAsg
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs: { Service: autoscaling, Api: StartInstanceRefresh, AutoScalingGroupName: '{{ AutoScalingGroupName }}' }
+
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ssm.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: mitigation-actions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:RebootInstances
+                  - ecs:UpdateService
+                  - autoscaling:StartInstanceRefresh
+                  - cloudwatch:DescribeAlarmHistory
+                Resource: '*'
+
+  # -------------------- Reusable managed policy (secret) ------------------ #
+  SecretReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref IntegrationSecret
+
+Outputs:
+  AlarmTopicArn:
+    Description: Point your CloudWatch alarms' AlarmActions at this SNS topic.
+    Value: !Ref AlarmTopic
+  ApprovalApiEndpoint:
+    Description: Base URL backing the Glip Approve/Reject links.
+    Value: !Sub 'https://${ApprovalApi}.execute-api.${AWS::Region}.amazonaws.com'
+  StateMachineArn:
+    Value: !Ref IncidentStateMachine
+  MitigationRunbookName:
+    Condition: ShouldCreateRunbook
+    Value: !Ref MitigationRunbook

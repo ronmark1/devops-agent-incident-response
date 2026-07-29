@@ -1,0 +1,14 @@
+[
+  { "ParameterKey": "DevOpsAgentWebhookUrl",      "ParameterValue": "https://devops-agent.us-east-1.amazonaws.com/webhooks/space-XXXX" },
+  { "ParameterKey": "DevOpsAgentWebhookSecret",   "ParameterValue": "REPLACE_WITH_HMAC_SECRET" },
+  { "ParameterKey": "DevOpsAgentApiBase",         "ParameterValue": "https://devops-agent.us-east-1.amazonaws.com" },
+  { "ParameterKey": "DevOpsAgentApiKey",          "ParameterValue": "REPLACE_WITH_API_KEY" },
+  { "ParameterKey": "GlipWebhookUrl",             "ParameterValue": "https://hooks.ringcentral.com/webhook/v2/REPLACE" },
+  { "ParameterKey": "FreshserviceDomain",         "ParameterValue": "yourcompany.freshservice.com" },
+  { "ParameterKey": "FreshserviceApiKey",         "ParameterValue": "REPLACE_WITH_FRESHSERVICE_KEY" },
+  { "ParameterKey": "FreshserviceRequesterEmail", "ParameterValue": "aws-devops-agent@yourcompany.com" },
+  { "ParameterKey": "ApprovalSigningKey",         "ParameterValue": "REPLACE_WITH_LONG_RANDOM_STRING" },
+  { "ParameterKey": "CreateDefaultRunbook",       "ParameterValue": "true" },
+  { "ParameterKey": "ExistingDefaultRunbookName", "ParameterValue": "" },
+  { "ParameterKey": "AdditionalPublisherAccountIds", "ParameterValue": "" }
+]
